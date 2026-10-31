@@ -8,7 +8,7 @@ This is a digitilization of the first level that I made physically. This level i
 - Open the file with the web browser of your preference.
 - The game will begin automatically.
 
-## Controlls.
+## Controls.
 - D, A, Right arrow or Left arrow to move forward or backwards.
 - Space or W to jump.
 - E to interact
