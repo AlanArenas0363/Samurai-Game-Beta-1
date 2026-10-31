@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Samurái – Level 1 (prototype)</title>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --fg: #222;
+      box-sizing: border-box;
+      padding-top: env(safe-area-inset-top, 0px);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #15131a;
+        --fg: #eee;
+      }
+    }
+
+    :root[data-theme="dark"] {
+      --bg: #15131a;
+      --fg: #eee;
+    }
+
+    html, body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, sans-serif;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+    }
+
+    #g {
+      width: 100%;
+      max-width: 960px;
+    }
+
+    p {
+      margin: 0;
+      font-size: 14px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="g"></div>
+  <p>Move: ← → o A D · Jump: ↑ o W · Attack: Space o J · Interact: E · Reload: R</p>
+
+  <!-- Phaser 3 Engine -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.80.1/phaser.min.js"></script>
+  <script>
+    // Global canvas height and ground level Y-coordinate
+    const H = 540;
+    const GY = 470;
+
+    // Persistent game state across scene transitions
+    const state = {
+      hp: 5,
+      coins: 0,
+      done: {} // Tracks cleared sub-rooms
+    };
+
+    // Main world level configuration
+    const LEVEL = {
+      width: 5200,
+      sky: 0x1c1530,
+      ground: 0x3a3340,
+      outdoor: true,
+      enemies: [800, 1250, 2000, 2750, 3700, 4300],
+      doors: [
+        { x: 1650, room: 1 },
+        { x: 3350, room: 2 },
+        { x: 4950, end: true }
+      ],
+      deco: [
+        ['sakura', 280], ['lamp', 500], ['house', 900, 280, 230, 0],
+        ['garland', 1080, 340], ['house', 1650, 400, 270, 1], ['garland', 1900, 350],
+        ['house', 2400, 250, 180, 1], ['sakura', 2750], ['pine', 3040],
+        ['lantern', 3200], ['storii', 3350], ['lantern', 3500],
+        ['pine', 3660], ['lamp', 4000], ['sakura', 4400], ['shrine', 4950]
+      ]
+    };
+
+    // Sub-room configurations entered via doors
+    const ROOMS = {
+      1: {
+        width: 1400,
+        sky: 0x2a1f2d,
+        ground: 0x5a4630,
+        enemies: [500, 700, 900, 1100],
+        bonus: 50,
+        doors: [{ x: 70, exit: true }],
+        deco: [['shoji', 1400]]
+      },
+      2: {
+        width: 2200,
+        sky: 0x1e2a4a,
+        ground: 0x4a4d45,
+        outdoor: true,
+        enemies: [550, 800, 1000, 1250, 1550, 1850],
+        bonus: 80,
+        doors: [{ x: 70, exit: true }],
+        deco: [
+          ['pine', 300], ['slantern', 520], ['pine', 700], ['hall', 1100],
+          ['slantern', 900], ['slantern', 980], ['slantern', 1220],
+          ['slantern', 1300], ['pine', 1650], ['sakura', 1900]
+        ]
+      }
+    };
+
+    /**
+     * Boot Scene
+     * Generates programmatic pixel textures on the fly to avoid external asset loading.
+     */
+    class Boot extends Phaser.Scene {
+      constructor() {
+        super('Boot');
+      }
+
+      create() {
+        const g = this.add.graphics();
+        const mk = (key, w, h, drawFn) => {
+          g.clear();
+          drawFn(g);
+          g.generateTexture(key, w, h);
+        };
+
+        // Player texture ('p')
+        mk('p', 28, 44, s => {
+          s.fillStyle(0x1b2a4a).fillRect(0, 12, 28, 32);  // Kimono body
+          s.fillStyle(0xe8c9a0).fillRect(6, 0, 16, 14);   // Head / Face
+          s.fillStyle(0x111111).fillRect(4, 0, 20, 5);    // Hair
+          s.fillStyle(0xc0392b).fillRect(0, 26, 28, 5);   // Obi / Sash belt
+        });
+
+        // Enemy texture ('e')
+        mk('e', 28, 44, s => {
+          s.fillStyle(0x6b2d2d).fillRect(0, 12, 28, 32);  // Dark red robe
+          s.fillStyle(0xd9b38c).fillRect(6, 0, 16, 14);   // Face
+          s.fillStyle(0x000000).fillRect(4, 0, 20, 4);    // Hair
+        });
+
+        g.destroy();
+        this.scene.start('Level');
+      }
+    }
+
+    /**
+     * Main Level Scene
+     * Handles level loading, parallax backdrop, physics, input, combat, and room transitions.
+     */
+    class Level extends Phaser.Scene {
+      constructor() {
+        super('Level');
+      }
+
+      init(d = {}) {
+        this.roomId = d.room || 0;
+        this.cfg = this.roomId ? ROOMS[this.roomId] : LEVEL;
+        this.ret = d.retX;
+        this.spawn = this.roomId ? 130 : (d.retX || 100);
+
+        // Combat & status timestamps / flags
+        this.over = false;
+        this.inv = 0;   // Invulnerability period (timestamp)
+        this.kb = 0;    // Knockback recovery period (timestamp)
+        this.cool = 0;  // Attack cooldown (timestamp)
+        this.dir = 1;   // Horizontal facing direction (-1 left, 1 right)
+      }
+
+      create() {
+        const c = this.cfg;
+        const W = c.width;
+        const cam = this.cameras.main;
+
+        this.physics.world.setBounds(0, 0, W, H);
+        cam.setBounds(0, 0, W, H).setBackgroundColor(c.sky);
+
+        // Render multi-layered parallax background for outdoor environments
+        if (c.outdoor) {
+          const bindScroll = (obj, factor) => obj.setScrollFactor(factor);
+
+          // Stars / dust particles
+          for (let i = 0; i < 90; i++) {
+            bindScroll(this.add.circle(Math.random() * 1400, Math.random() * 250, Math.random() * 1.5 + 0.5, 0xffffff, 0.8), 0.02);
+          }
+
+          // Moon
+          bindScroll(this.add.circle(700, 90, 70, 0xf5efd0, 0.12), 0.05);
+          bindScroll(this.add.circle(700, 90, 40, 0xf5efd0), 0.05);
+
+          // Distant mountain silhouettes
+          bindScroll(this.add.triangle(520, GY - 150, 0, 300, 560, 300, 280, 0, 0x3a3560), 0.1);
+          bindScroll(this.add.triangle(520, GY - 262, 0, 80, 150, 80, 75, 0, 0xe8e6f5), 0.1);
+
+          // Rolling hills
+          for (let i = 0; i < 9; i++) {
+            bindScroll(this.add.ellipse(i * 260 + 100, GY - 10, 520, 200 + (i % 3) * 60, 0x2b2848), 0.2);
+          }
+          for (let i = 0; i < 11; i++) {
+            bindScroll(this.add.ellipse(i * 240 + 60, GY, 460, 220 + (i % 2) * 50, 0x221f3a), 0.35);
+          }
+
+          // Distant village silhouettes
+          for (let i = 0; i < 10; i++) {
+            const px = i * 320 + 150;
+            if (i % 2) {
+              for (let k = 0; k < 3; k++) {
+                bindScroll(this.add.rectangle(px, GY - 30 - k * 34, 70 - k * 14, 26, 0x1a1830), 0.5);
+                bindScroll(this.add.rectangle(px, GY - 46 - k * 34, 100 - k * 18, 8, 0x1a1830), 0.5);
+                bindScroll(this.add.rectangle(px, GY - 30 - k * 34, 6, 8, 0xffc874), 0.5);
+              }
+            } else {
+              bindScroll(this.add.rectangle(px, GY - 35, 120, 70, 0x1a1830), 0.5);
+              bindScroll(this.add.triangle(px, GY - 85, 0, 36, 150, 36, 75, 0, 0x1a1830), 0.5);
+              bindScroll(this.add.rectangle(px - 25, GY - 35, 14, 18, 0xffc874), 0.5);
+              bindScroll(this.add.rectangle(px + 25, GY - 35, 14, 18, 0xffc874), 0.5);
+            }
+          }
+
+          // Mid-ground trees (cherry blossom & pine)
+          for (let i = 0; i < 14; i++) {
+            const tx = i * 300 + 60;
+            if (i % 3 === 0) {
+              bindScroll(this.add.rectangle(tx, GY - 50, 10, 100, 0x24161a), 0.7);
+              for (const [dx, dy, r] of [[0, -110, 40], [-30, -85, 32], [30, -85, 32]]) {
+                bindScroll(this.add.circle(tx + dx, GY + dy, r, 0xb86a8c, 0.9), 0.7);
+              }
+            } else {
+              bindScroll(this.add.rectangle(tx, GY - 30, 8, 60, 0x1a1a14), 0.7);
+              for (let k = 0; k < 3; k++) {
+                bindScroll(this.add.triangle(tx, GY - 70 - k * 30, 0, 50, 100 - k * 20, 50, (100 - k * 20) / 2, 0, 0x17302a), 0.7);
+              }
+            }
+          }
+        }
+
+        // Static ground platform collider
+        const gr = this.add.rectangle(W / 2, (GY + H) / 2, W, H - GY, c.ground);
+        this.physics.add.existing(gr, true);
+
+        // Procedural decorative structures
+        const R = (x, y, w, h, col) => this.add.rectangle(x, y, w, h, col);
+        for (const d of c.deco) {
+          const t = d[0];
+          const x = d[1];
+
+          if (t === 'house') {
+            const w = d[2], h = d[3], fl = h > 200 ? 2 : 1, fh = h / fl, wood = 0x5a3a22, wall = 0xe8dcc0;
+            const win = (cx, cy, ww, hh) => {
+              R(cx, cy, ww, hh, 0xffc874).setStrokeStyle(3, wood);
+              for (let i = 1; i < 4; i++) R(cx - ww / 2 + i * ww / 4, cy, 2, hh, wood);
+              R(cx, cy, ww, 2, wood);
+            };
+            for (let f = 0; f < fl; f++) {
+              const b = GY - fh * f, yc = b - fh / 2;
+              R(x, yc, w, fh, wall);
+              R(x, b - fh * 0.14, w, fh * 0.28, wood);
+              for (let i = 0; i <= 4; i++) R(x - w / 2 + i * w / 4, yc, 6, fh, wood);
+              R(x, b - fh + 4, w, 8, wood);
+              win(x - w * 0.375, yc - fh * 0.1, w / 4 - 16, fh * 0.4);
+              win(x + w * 0.375, yc - fh * 0.1, w / 4 - 16, fh * 0.4);
+              if (f) {
+                win(x - w * 0.125, yc - fh * 0.1, w / 4 - 16, fh * 0.4);
+                win(x + w * 0.125, yc - fh * 0.1, w / 4 - 16, fh * 0.4);
+              }
+              R(x, b - fh, w + 40, 10, 0x2e2e38);
+              R(x, b - fh + 6, w + 40, 3, 0x7a5a3a);
+            }
+            if (d[4]) {
+              const rW = w + 100;
+              this.add.triangle(x, GY - h - 40, 0, 80, rW, 80, rW / 2, 0, 0x2e2e38);
+              for (let i = 0; i < 3; i++) {
+                const tt = 14 + i * 20;
+                R(x, GY - h - tt, rW * (1 - tt / 80), 3, 0x4a4a58);
+              }
+            } else {
+              R(x, GY - h - 16, w + 70, 26, 0x2e2e38);
+              R(x, GY - h - 34, w * 0.7, 12, 0x3a3a46);
+            }
+            for (const s of [-1, 1]) {
+              this.add.circle(x + s * w * 0.25, GY - fh + 30, 22, 0xff8a3d, 0.25);
+              this.add.ellipse(x + s * w * 0.25, GY - fh + 30, 16, 22, 0xd9432b).setStrokeStyle(2, 0x3a1a10);
+            }
+          }
+
+          if (t === 'lamp') {
+            R(x, GY - 100, 8, 200, 0x222222);
+            R(x, GY - 205, 26, 18, 0xf6c453);
+          }
+
+          if (t === 'pine') {
+            R(x, GY - 60, 16, 120, 0x2a1a12);
+            for (let i = 0; i < 4; i++) {
+              const tw = 150 - i * 22;
+              this.add.triangle(x, GY - 110 - i * 45, 0, 70, tw, 70, tw / 2, 0, 0x1e3a2c);
+            }
+          }
+
+          if (t === 'sakura') {
+            R(x, GY - 70, 20, 140, 0x3a2218);
+            for (const [dx, dy, r] of [[0, -170, 70], [-55, -130, 55], [55, -130, 55], [0, -110, 60]]) {
+              this.add.circle(x + dx, GY + dy, r, 0xe98fb5, 0.92);
+            }
+          }
+
+          if (t === 'garland') {
+            const len = d[2], n = 9;
+            let px = 0, py = 0;
+            for (let i = 0; i < n; i++) {
+              const u = i / (n - 1), lx = x + u * len, ly = GY - 270 + Math.sin(u * Math.PI) * 40;
+              if (i) this.add.line(0, 0, px, py, lx, ly, 0x222222).setOrigin(0, 0).setLineWidth(2);
+              px = lx; py = ly;
+            }
+            for (let i = 0; i < n; i++) {
+              const u = i / (n - 1), lx = x + u * len, ly = GY - 270 + Math.sin(u * Math.PI) * 40;
+              this.add.circle(lx, ly + 14, 16, 0xffe1a0, 0.25);
+              this.add.ellipse(lx, ly + 14, 16, 24, [0xe74c3c, 0xf1c40f, 0x2ecc71, 0xe98fb5, 0x3498db][i % 5]).setStrokeStyle(2, 0x222222);
+            }
+          }
+
+          if (t === 'storii') {
+            const st = 0xbdbab0, mo = 0x5f8a45;
+            R(x - 70, GY - 105, 18, 210, st);
+            R(x + 70, GY - 105, 18, 210, st);
+            R(x, GY - 218, 250, 18, st);
+            R(x, GY - 229, 230, 5, mo);
+            R(x - 80, GY - 224, 50, 6, mo);
+            R(x, GY - 202, 220, 10, 0xa5a298);
+            R(x, GY - 185, 14, 22, st);
+            R(x, GY - 165, 215, 12, st);
+            R(x - 70, GY - 10, 26, 18, mo);
+            R(x + 70, GY - 10, 26, 18, mo);
+            R(x - 70, GY - 150, 10, 40, 0x8f8c82);
+            R(x + 70, GY - 60, 10, 60, 0x8f8c82);
+            R(x, GY - 148, 150, 8, 0xc9a24a);
+            for (const s of [-40, 0, 40]) R(x + s, GY - 128, 12, 26, 0xd9b24a);
+            R(x - 20, GY - 132, 6, 20, 0xffffff);
+            R(x + 20, GY - 132, 6, 20, 0xffffff);
+          }
+
+          if (t === 'slantern') {
+            this.add.circle(x, GY - 96, 34, 0xffc874, 0.18);
+            R(x, GY - 6, 26, 12, 0x8a8880);
+            R(x, GY - 40, 12, 80, 0x9a9890);
+            R(x, GY - 96, 30, 36, 0xd9431f).setStrokeStyle(2, 0x3a1810);
+            R(x, GY - 96, 16, 22, 0xffe9a8);
+            this.add.triangle(x, GY - 124, 0, 18, 48, 18, 24, 0, 0x4a3a30);
+          }
+
+          if (t === 'hall') {
+            const hw = 520, hW = hw + 120, red = 0xd9431f;
+            R(x, GY - 10, hw + 40, 20, 0x9b9a92);
+            R(x, GY - 120, hw, 200, 0x1c1210);
+            for (let i = 0; i <= 5; i++) R(x - hw / 2 + i * hw / 5, GY - 120, 14, 200, red);
+            R(x, GY - 215, hw, 16, red);
+            R(x, GY - 70, hw - 20, 8, red);
+            for (let i = 0; i < hw / 14 - 1; i++) R(x - hw / 2 + 14 + i * 14, GY - 48, 4, 40, red);
+            R(x, GY - 232, hw + 30, 10, red);
+            for (let i = 0; i < hw / 16; i++) R(x - hw / 2 + i * 16 + 8, GY - 232, 5, 5, 0xffffff);
+            this.add.polygon(x, GY - 283, [0, 90, 70, 0, hW - 70, 0, hW, 90], 0x3b4a44);
+            R(x, GY - 241, hW, 6, 0x1a1a1a);
+            R(x, GY - 373, hW - 150, 8, 0x2a3330);
+            R(x, GY - 190, hw * 0.6, 6, 0xc9a24a);
+            for (let s = -2; s <= 2; s++) R(x + s * hw * 0.12, GY - 172, 10, 30, 0xd9b24a);
+            R(x, GY - 205, 26, 34, 0x1a1a1a).setStrokeStyle(2, 0xc9a24a);
+            R(x, GY - 4, 200, 8, 0xa8a79f);
+            R(x, GY - 12, 176, 8, 0xb4b3aa);
+            R(x, GY - 20, 152, 8, 0xbfbeb5);
+          }
+
+          if (t === 'lantern') {
+            R(x, GY - 30, 10, 60, 0x888888);
+            R(x, GY - 70, 24, 22, 0xe67e22);
+          }
+
+          if (t === 'torii') {
+            R(x - 70, GY - 110, 16, 220, 0xc0392b);
+            R(x + 70, GY - 110, 16, 220, 0xc0392b);
+            R(x, GY - 200, 190, 14, 0xc0392b);
+            R(x, GY - 225, 240, 12, 0x222222);
+            R(x, GY - 165, 140, 6, 0xc9a24a);
+          }
+
+          if (t === 'shrine') {
+            R(x, GY - 80, 200, 160, 0xc0392b).setStrokeStyle(3, 0x222222);
+            this.add.triangle(x, GY - 190, 0, 60, 260, 60, 130, 0, 0x2c2c34);
+            R(x - 130, GY - 40, 10, 80, 0x888888);
+            R(x + 130, GY - 40, 10, 80, 0x888888);
+            R(x - 130, GY - 90, 24, 20, 0xe67e22);
+            R(x + 130, GY - 90, 24, 20, 0xe67e22);
+          }
+
+          if (t === 'shoji') {
+            R(x / 2, 24, x, 48, 0x3a2414);
+            for (let i = 0; i <= Math.floor(x / 220); i++) R(50 + i * 220, GY / 2, 10, GY, 0x5a3a22);
+            for (let i = 0; i < Math.floor(x / 220); i++) {
+              R(160 + i * 220, GY - 120, 170, 230, 0xe9dfc2).setStrokeStyle(4, 0x222222);
+              R(160 + i * 220, GY - 120, 2, 230, 0x222222);
+              R(160 + i * 220, GY - 170, 170, 2, 0x222222);
+              R(160 + i * 220, GY - 70, 170, 2, 0x222222);
+            }
+          }
+        }
+
+        // Render door gateways
+        this.doors = c.doors;
+        for (const d of c.doors) {
+          if (d.room === 1) {
+            R(d.x, GY - 45, 56, 90, 0x6b4426).setStrokeStyle(3, 0x2a1a10);
+            R(d.x, GY - 48, 40, 70, 0xffc874);
+            R(d.x, GY - 92, 60, 26, 0x1f3a6a);
+          } else if (d.room === 2) {
+            R(d.x, GY - 80, 100, 160, 0x0b1f14).setAlpha(0.55);
+          } else {
+            R(d.x, GY - 45, 50, 90, d.exit ? 0x3b6ea5 : 0xf6c453).setAlpha(0.85);
+          }
+        }
+
+        // Player setup
+        this.p = this.physics.add.sprite(this.spawn, GY - 60, 'p').setCollideWorldBounds(true);
+        this.physics.add.collider(this.p, gr);
+
+        // Enemies setup & initial patrol behavior
+        this.enemies = this.physics.add.group();
+        for (const x of c.enemies) {
+          const e = this.enemies.create(x, GY - 60, 'e');
+          e.hp = 2;
+          e.ox = x; // Original patrol center
+          e.v = Math.random() < 0.5 ? -1 : 1; // Initial direction
+          e.stun = 0;
+          e.setCollideWorldBounds(true);
+        }
+        this.physics.add.collider(this.enemies, gr);
+
+        // Player damage collision with invulnerability & knockback handling
+        this.physics.add.overlap(this.p, this.enemies, (pl, e) => {
+          if (this.time.now < this.inv || this.over) return;
+          this.inv = this.time.now + 1000;
+          this.kb = this.time.now + 250;
+          state.hp--;
+          pl.setVelocity(Math.sign(pl.x - e.x || 1) * 250, -220);
+          pl.setTint(0xff6666);
+          this.time.delayedCall(300, () => pl.clearTint());
+        });
+
+        // Smooth camera follow
+        cam.startFollow(this.p, true, 0.1, 0.1);
+
+        // Input controls
+        this.cur = this.input.keyboard.createCursorKeys();
+        this.k = this.input.keyboard.addKeys('W,A,D,E,J,SPACE,R');
+
+        // UI Displays
+        this.hud = this.add.text(12, 10, '', {
+          font: '18px sans-serif',
+          color: '#ffffff',
+          stroke: '#000000',
+          strokeThickness: 3
+        }).setScrollFactor(0).setDepth(10);
+
+        this.prompt = this.add.text(480, 500, '', {
+          font: '18px sans-serif',
+          color: '#ffffff',
+          backgroundColor: '#000000aa',
+          padding: { x: 10, y: 4 }
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(10);
+
+        this.msg = this.add.text(480, 240, '', {
+          font: 'bold 28px sans-serif',
+          color: '#ffffff',
+          stroke: '#000000',
+          strokeThickness: 5,
+          align: 'center'
+        }).setOrigin(0.5).setScrollFactor(0).setDepth(10);
+
+        if (this.roomId) {
+          this.msg.setText('Kill all the enemies!');
+          this.time.delayedCall(2200, () => this.msg.setText(''));
+        }
+      }
+
+      // Floating popup text animation (e.g., +10 coins)
+      pop(x, y, s) {
+        const t = this.add.text(x, y, s, {
+          font: 'bold 20px sans-serif',
+          color: '#f1c40f',
+          stroke: '#000000',
+          strokeThickness: 3
+        }).setOrigin(0.5);
+
+        this.tweens.add({
+          targets: t,
+          y: y - 50,
+          alpha: 0,
+          duration: 900,
+          onComplete: () => t.destroy()
+        });
+      }
+
+      // Melee attack hitbox and hit check
+      attack() {
+        const p = this.p;
+        const now = this.time.now;
+        if (now < this.cool) return;
+        this.cool = now + 350;
+
+        const sx = p.x + this.dir * 40;
+
+        // Visual slash effect
+        const s = this.add.rectangle(sx, p.y, 50, 8, 0xffffff);
+        this.tweens.add({
+          targets: s,
+          alpha: 0,
+          duration: 150,
+          onComplete: () => s.destroy()
+        });
+
+        // Hit detection against all active enemies in range
+        for (const e of this.enemies.getChildren()) {
+          if (!e.active) continue;
+          if (Math.abs(e.x - sx) < 50 && Math.abs(e.y - p.y) < 45) {
+            e.hp--;
+            e.stun = now + 250;
+            e.setVelocityX(this.dir * 220); // Knockback
+            e.setTint(0xffffff);
+            this.time.delayedCall(120, () => e.active && e.clearTint());
+
+            if (e.hp <= 0) {
+              this.pop(e.x, e.y - 30, '+10');
+              state.coins += 10;
+              e.destroy();
+              this.checkClear();
+            }
+          }
+        }
+      }
+
+      // Award bonus if sub-room has been completely cleared of enemies
+      checkClear() {
+        if (this.roomId && this.enemies.countActive() === 0 && !state.done[this.roomId]) {
+          state.done[this.roomId] = true;
+          state.coins += this.cfg.bonus;
+          this.msg.setText('');
+        }
+      }
+
+      restart() {
+        state.hp = 5;
+        state.coins = 0;
+        state.done = {};
+        this.scene.start('Level');
+      }
+
+      update() {
+        const k = this.k;
+        const p = this.p;
+        const now = this.time.now;
+        const J = Phaser.Input.Keyboard.JustDown;
+
+        // Update HUD
+        this.hud.setText(`❤ ${Math.max(state.hp, 0)}   Yen: ${state.coins}`);
+
+        // Handle death & restart
+        if (J(k.R) && this.over) return this.restart();
+        if (this.over) return;
+        if (state.hp <= 0) {
+          this.over = true;
+          this.physics.pause();
+          this.msg.setText('You are dead…\nPress R to retry!');
+          return;
+        }
+
+        // Player movement & jumping (locked while knocked back)
+        if (now > this.kb) {
+          const L = this.cur.left.isDown || k.A.isDown;
+          const Rt = this.cur.right.isDown || k.D.isDown;
+
+          p.setVelocityX(L ? -220 : Rt ? 220 : 0);
+          if (L) this.dir = -1;
+          if (Rt) this.dir = 1;
+          p.setFlipX(this.dir < 0);
+
+          if ((this.cur.up.isDown || k.W.isDown) && p.body.blocked.down) {
+            p.setVelocityY(-480);
+          }
+        }
+
+        // Trigger attack
+        if (J(k.SPACE) || J(k.J)) this.attack();
+
+        // Enemy AI: chase player if close, otherwise patrol within range
+        for (const e of this.enemies.getChildren()) {
+          if (!e.active || now < e.stun) continue;
+          const dx = p.x - e.x;
+
+          if (Math.abs(dx) < 320 && Math.abs(p.y - e.y) < 80) {
+            e.setVelocityX(Math.sign(dx) * 95); // Aggro chase
+          } else {
+            if (Math.abs(e.x - e.ox) > 120) e.v = -Math.sign(e.x - e.ox); // Turn around at patrol boundary
+            e.setVelocityX(e.v * 50);
+          }
+          e.setFlipX(e.body.velocity.x < 0);
+        }
+
+        // Door interaction & room transitions
+        let near = null;
+        for (const d of this.doors) {
+          if (Math.abs(p.x - d.x) < 45) near = d;
+        }
+
+        if (!near || (near.room && state.done[near.room])) {
+          this.prompt.setText('').setVisible(false);
+        } else {
+          const label = near.exit
+            ? 'E: leave'
+            : near.end
+              ? 'E: finish  the level'
+              : 'E: enter';
+
+          this.prompt.setText(label).setVisible(true);
+
+          if (J(k.E)) {
+            if (near.exit) {
+              this.scene.start('Level', { retX: this.ret });
+            } else if (near.end) {
+              this.over = true;
+              this.physics.pause();
+              this.msg.setText(`Level 1 completed!\nYen collected: ${state.coins}\nPress R to reload!`);
+            } else if (!state.done[near.room]) {
+              this.scene.start('Level', { room: near.room, retX: near.x });
+            }
+          }
+        }
+      }
+    }
+
+    // Phaser game instance setup
+    new Phaser.Game({
+      type: Phaser.AUTO,
+      parent: 'g',
+      width: 960,
+      height: 540,
+      physics: {
+        default: 'arcade',
+        arcade: { gravity: { y: 900 } }
+      },
+      scale: {
+        mode: Phaser.Scale.FIT,
+        autoCenter: Phaser.Scale.CENTER_HORIZONTALLY
+      },
+      scene: [Boot, Level]
+    });
+  </script>
+</body>
+</html>
