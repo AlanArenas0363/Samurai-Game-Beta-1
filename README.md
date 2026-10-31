@@ -4,9 +4,10 @@ This is a digitilization of the first level that I made physically. This level i
 
 ## How to play this game.
 
-- Download the "game.html" file.
+- Download the "index.html" file.
 - Open the file with the web browser of your preference.
 - The game will begin automatically.
+- Or, paste this link on your browser: https://alanarenas0363.github.io/Samurai-Game-Beta-1/
 
 ## Controls.
 - D, A, Right arrow or Left arrow to move forward or backwards.
